@@ -4,6 +4,9 @@ import streamlit as st
 
 from gps_dashboard.analysis import classify_speed_segments, detect_slow_zones, detect_stops, trip_efficiency
 from gps_dashboard.gpx_processing import parse_gpx_file, summarize_trip
+from gps_dashboard.history import load_all_trips, save_trip, trip_exists
+from gps_dashboard.similarity import compute_route_id, compute_comparison_stats, find_similar_trips
+from gps_dashboard.trip_builder import build_trip_record
 from gps_dashboard.visualization import heatmap_figure, histogram_speed, line_distance_vs_time, line_speed_vs_time, map_speed_trace
 
 st.set_page_config(page_title="DriveSense — GPS Trip Intelligence", layout="wide")
@@ -125,6 +128,18 @@ def style_figure(fig):
     return fig
 
 
+def _delta_label(value: float, unit: str, invert: bool = False) -> str:
+    """Formate un delta avec signe et couleur Streamlit (via markdown)."""
+    sign = "+" if value >= 0 else ""
+    return f"{sign}{value:.1f} {unit}"
+
+
+@st.cache_data(ttl=30)
+def _load_history() -> "pd.DataFrame":
+    """Charge l'historique avec un cache court pour éviter les lectures répétées."""
+    return load_all_trips()
+
+
 st.markdown("""
 <style>
 .main {
@@ -148,17 +163,48 @@ div[data-testid="stMetricLabel"] {
     padding: 14px;
     background: rgba(15, 23, 42, 0.7);
 }
+.comparison-card {
+    border: 1px solid #1d4ed8;
+    border-radius: 14px;
+    padding: 16px;
+    background: rgba(30, 58, 138, 0.15);
+}
 </style>
 """, unsafe_allow_html=True)
 
 st.title("🚘 DriveSense — Trip Intelligence")
 st.caption("Analyse premium d'un trajet voiture à partir d'un fichier GPX : fluidité, points de friction et recommandations actionnables.")
 
+# ---------------------------------------------------------------------------
+# Sidebar — Paramètres + Historique
+# ---------------------------------------------------------------------------
 with st.sidebar:
     st.header("Paramètres d'analyse")
     stop_speed_threshold = st.slider("Seuil arrêt (km/h)", min_value=0.1, max_value=5.0, value=1.0, step=0.1)
     min_stop_duration = st.slider("Durée minimale d'un arrêt (secondes)", min_value=30, max_value=600, value=90, step=30)
     st.caption("Ajustez selon trafic urbain vs autoroute pour éviter les faux positifs.")
+
+    st.markdown("---")
+    st.header("Historique")
+    try:
+        history_df = _load_history()
+        if history_df.empty:
+            st.caption("Aucun trajet enregistré. Importez un fichier GPX et sauvegardez-le.")
+        else:
+            st.caption(f"{len(history_df)} trajet(s) enregistré(s).")
+            for _, row in history_df.head(5).iterrows():
+                import pandas as _pd
+                date_str = (
+                    _pd.to_datetime(row["trip_date"]).strftime("%d/%m/%Y")
+                    if _pd.notna(row["trip_date"])
+                    else "?"
+                )
+                st.caption(
+                    f"• {date_str} — {row['distance_km']:.1f} km — score **{row['score']:.0f}**"
+                )
+    except Exception:
+        history_df = None
+        st.caption("Historique non disponible.")
 
 uploaded_file = st.file_uploader("Importer un fichier GPX", type=["gpx"])
 
@@ -182,7 +228,61 @@ summary = summarize_trip(segmented)
 score, score_label, score_message = trip_score(summary, eff, len(stops))
 insights = build_insights(summary, eff, stops, slow_zones)
 
+# Construire le TripRecord du trajet courant (pas encore sauvegardé).
+current_record = build_trip_record(
+    filename=uploaded_file.name,
+    df=segmented,
+    summary=summary,
+    efficiency=eff,
+    stops=stops,
+    score=score,
+)
+
+# Préparer le dict de comparaison pour find_similar_trips.
+current_dict = {
+    "start_lat": current_record.start_lat,
+    "start_lon": current_record.start_lon,
+    "end_lat": current_record.end_lat,
+    "end_lon": current_record.end_lon,
+    "distance_km": current_record.distance_km,
+    "route_id": current_record.route_id,
+    "score": score,
+    "duration_h": current_record.duration_h,
+    "moving_avg_speed_kmh": current_record.moving_avg_speed_kmh,
+    "stop_count": current_record.stop_count,
+}
+
+# Charger l'historique et calculer la comparaison (si disponible).
+comparison: dict = {"has_comparison": False, "count": 0}
+similar_df = None
+try:
+    if history_df is not None and not history_df.empty:
+        similar_df = find_similar_trips(current_dict, history_df)
+        comparison = compute_comparison_stats(current_dict, similar_df)
+except Exception:
+    pass
+
+# ---------------------------------------------------------------------------
+# Sidebar — Sauvegarde du trajet courant
+# ---------------------------------------------------------------------------
+with st.sidebar:
+    st.markdown("---")
+    already_saved = trip_exists(current_record.id)
+    if already_saved:
+        st.success("Trajet déjà sauvegardé.")
+    else:
+        if st.button("💾 Sauvegarder ce trajet", use_container_width=True):
+            try:
+                save_trip(current_record)
+                st.cache_data.clear()
+                st.success("Trajet sauvegardé dans l'historique.")
+                st.rerun()
+            except Exception as exc:
+                st.error(f"Erreur lors de la sauvegarde : {exc}")
+
+# ---------------------------------------------------------------------------
 # 1) Hero + score global
+# ---------------------------------------------------------------------------
 section_title("VUE RAPIDE", "Résumé intelligent du trajet", "Compréhension en 5 secondes : score, durée, distance, fluidité.")
 hero_left, hero_right = st.columns([1.3, 2.2], gap="large")
 
@@ -213,7 +313,79 @@ with hero_right:
 
 st.markdown("---")
 
-# 2) Carte centrale + panneau insights
+# ---------------------------------------------------------------------------
+# 2) Comparaison avec l'historique (conditionnel)
+# ---------------------------------------------------------------------------
+if comparison.get("has_comparison"):
+    section_title(
+        "COMPARAISON",
+        "Performance sur cet itinéraire habituel",
+        f"Basé sur {comparison['count']} trajet(s) similaire(s) enregistré(s).",
+    )
+
+    st.markdown('<div class="comparison-card">', unsafe_allow_html=True)
+
+    c1, c2, c3, c4 = st.columns(4)
+
+    # Score
+    score_delta = comparison["score_delta"]
+    c1.metric(
+        "Score moyen habituel",
+        f"{comparison['avg_score']:.0f}/100",
+        delta=_delta_label(score_delta, "pts"),
+        delta_color="normal" if score_delta >= 0 else "inverse",
+    )
+
+    # Durée
+    dur_delta = comparison["duration_delta_min"]
+    dur_delta_label = _delta_label(-dur_delta, "min")  # négatif = gain de temps
+    c2.metric(
+        "Durée moyenne habituelle",
+        format_duration(comparison["avg_duration_h"]),
+        delta=f"{'-' if dur_delta > 0 else '+'}{abs(dur_delta):.0f} min",
+        delta_color="inverse" if dur_delta > 0 else "normal",
+    )
+
+    # Vitesse roulante
+    speed_delta = comparison["speed_delta"]
+    c3.metric(
+        "Vitesse roulante moyenne",
+        f"{comparison['avg_moving_speed_kmh']:.0f} km/h",
+        delta=_delta_label(speed_delta, "km/h"),
+        delta_color="normal" if speed_delta >= 0 else "inverse",
+    )
+
+    # Arrêts
+    stop_delta = comparison["stop_delta"]
+    c4.metric(
+        "Arrêts en moyenne",
+        f"{comparison['avg_stop_count']:.1f}",
+        delta=_delta_label(-stop_delta, "arrêt(s)"),
+        delta_color="normal" if stop_delta <= 0 else "inverse",
+    )
+
+    # Meilleur score + tendance textuelle
+    best = comparison["best_score"]
+    if score >= best:
+        st.success(f"Nouveau meilleur score sur cet itinéraire : **{score}/100** (précédent record : {best:.0f})")
+    elif score_delta >= 0:
+        st.info(f"Au-dessus de la moyenne habituelle de **{comparison['avg_score']:.0f}** — meilleur record : {best:.0f}/100")
+    else:
+        st.warning(f"En dessous de la moyenne habituelle de **{comparison['avg_score']:.0f}** — meilleur record : {best:.0f}/100")
+
+    st.markdown("</div>", unsafe_allow_html=True)
+    st.markdown("---")
+
+elif comparison.get("count") == 1:
+    st.info(
+        "1 trajet similaire trouvé dans l'historique. "
+        "Sauvegardez ce trajet pour obtenir des comparaisons dès le prochain import sur cet itinéraire."
+    )
+    st.markdown("---")
+
+# ---------------------------------------------------------------------------
+# 3) Carte centrale + panneau insights
+# ---------------------------------------------------------------------------
 section_title("LECTURE TRAJET", "Carte et événements clés", "La carte reste centrale, complétée par une lecture analytique des frictions.")
 map_col, insight_col = st.columns([2.1, 1], gap="large")
 
@@ -232,7 +404,9 @@ with insight_col:
 
 st.markdown("---")
 
-# 3) Story chronologique
+# ---------------------------------------------------------------------------
+# 4) Story chronologique
+# ---------------------------------------------------------------------------
 section_title("NARRATION", "Chronologie de performance", "Les graphiques racontent le trajet : rythme, progression, zones de tension.")
 
 c1, c2 = st.columns(2, gap="large")
@@ -256,7 +430,9 @@ with c2:
 
 st.markdown("---")
 
-# 4) Zones lentes et arrêts, orientés action
+# ---------------------------------------------------------------------------
+# 5) Zones lentes et arrêts, orientés action
+# ---------------------------------------------------------------------------
 section_title("ÉVÉNEMENTS", "Zones lentes et arrêts exploitables", "Tableaux orientés diagnostic opérationnel.")
 
 t1, t2 = st.columns(2, gap="large")
@@ -287,7 +463,9 @@ with t2:
             hide_index=True,
         )
 
-# 5) Détail technique replié
+# ---------------------------------------------------------------------------
+# 6) Détail technique replié
+# ---------------------------------------------------------------------------
 with st.expander("Voir les points enrichis (debug / audit)"):
     st.dataframe(segmented.head(500), use_container_width=True, hide_index=True)
 
